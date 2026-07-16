@@ -1,0 +1,31 @@
+name: APK Derle
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: JDK 17 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Gradle kur
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: APK derle
+        run: gradle assembleDebug
+
+      - name: APK'yı yükle (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WalkieTalkie-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
