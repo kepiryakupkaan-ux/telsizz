@@ -18,18 +18,11 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Gradle çalıştırma izni ver
-        run: chmod +x ./gradlew || true
-
-      - name: Gradle wrapper yoksa oluştur
-        run: |
-          if [ ! -f "./gradlew" ]; then
-            gradle wrapper --gradle-version 8.4
-            chmod +x ./gradlew
-          fi
+      - name: Gradle kur
+        uses: gradle/actions/setup-gradle@v3
 
       - name: APK derle
-        run: ./gradlew assembleDebug
+        run: gradle assembleDebug
 
       - name: APK'yı yükle (Artifacts)
         uses: actions/upload-artifact@v4
