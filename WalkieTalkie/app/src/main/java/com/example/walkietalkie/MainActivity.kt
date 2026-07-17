@@ -43,6 +43,7 @@ class MainActivity : AppCompatActivity() {
             service?.onPeersChanged = { peers ->
                 runOnUiThread { updatePeerList(peers) }
             }
+            service?.startListening()
             runOnUiThread { updatePeerList(service?.getCurrentPeers() ?: emptyList()) }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -172,9 +173,15 @@ class MainActivity : AppCompatActivity() {
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
     }
 
+    override fun onStart() {
+        super.onStart()
+        service?.startListening()
+    }
+
     override fun onStop() {
-        // Güvenlik: uygulamadan çıkarken DİNLE isteği açık kalmış olabilir, kapat.
+        // Güvenlik: uygulamadan çıkarken hem dinlemeyi hem DİNLE isteğini kapat.
         service?.stopRequestingAudio()
+        service?.stopListening()
         super.onStop()
     }
 
