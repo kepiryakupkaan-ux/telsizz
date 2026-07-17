@@ -5,11 +5,9 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.provider.Settings
 import android.view.MotionEvent
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -28,6 +26,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var pttButton: Button
+    private lateinit var listenButton: Button
     private lateinit var deviceListView: ListView
 
     private var currentPeers: List<PeerInfo> = emptyList()
@@ -44,8 +43,6 @@ class MainActivity : AppCompatActivity() {
             service?.onPeersChanged = { peers ->
                 runOnUiThread { updatePeerList(peers) }
             }
-            // Aktivite zaten görünür durumdaysa dinlemeyi hemen başlat
-            service?.startListening()
             runOnUiThread { updatePeerList(service?.getCurrentPeers() ?: emptyList()) }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -60,6 +57,7 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.statusText)
         pttButton = findViewById(R.id.pttButton)
+        listenButton = findViewById(R.id.listenButton)
         deviceListView = findViewById(R.id.deviceListView)
 
         listAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_single_choice, mutableListOf())
@@ -73,6 +71,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // BAS KONUŞ: basılı tuttuğun sürece senin sesin zorla karşıya gider
         pttButton.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
@@ -83,6 +82,23 @@ class MainActivity : AppCompatActivity() {
                 MotionEvent.ACTION_UP -> {
                     service?.stopTransmitting()
                     pttButton.text = "BASILI TUT VE KONUŞ"
+                    true
+                }
+                else -> false
+            }
+        }
+
+        // BAS DİNLE: basılı tuttuğun sürece karşı tarafın mikrofonu zorla senin için açılır
+        listenButton.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    service?.startRequestingAudio()
+                    listenButton.text = "DİNLENİYOR..."
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    service?.stopRequestingAudio()
+                    listenButton.text = "BASILI TUT VE DİNLE"
                     true
                 }
                 else -> false
@@ -143,15 +159,6 @@ class MainActivity : AppCompatActivity() {
             ActivityCompat.requestPermissions(this, missing.toTypedArray(), 100)
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            statusText.text = "Arka planda buton için 'diğer uygulamaların üzerine çizme' iznini de aç"
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            startActivity(intent)
-        }
-
         startAndBindService()
     }
 
@@ -165,15 +172,9 @@ class MainActivity : AppCompatActivity() {
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
     }
 
-    // ---------- Yaşam döngüsü: sadece uygulama görünürken dinle ----------
-
-    override fun onStart() {
-        super.onStart()
-        service?.startListening()
-    }
-
     override fun onStop() {
-        service?.stopListening()
+        // Güvenlik: uygulamadan çıkarken DİNLE isteği açık kalmış olabilir, kapat.
+        service?.stopRequestingAudio()
         super.onStop()
     }
 
@@ -183,6 +184,7 @@ class MainActivity : AppCompatActivity() {
             bound = false
         }
         super.onDestroy()
-        // Not: servis burada durdurulmuyor -> gönderme (PTT) uygulama kapansa bile çalışmaya devam eder.
+        // Not: servis burada durdurulmuyor -> KONUŞ (kayan buton) ve uzaktan DİNLE isteğine
+        // yanıt verme, uygulama kapansa bile arka planda çalışmaya devam eder.
     }
 }
