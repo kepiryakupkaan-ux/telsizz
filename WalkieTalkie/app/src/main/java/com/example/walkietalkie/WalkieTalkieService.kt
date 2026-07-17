@@ -26,16 +26,26 @@ import androidx.core.app.NotificationCompat
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
+
+/** Ağda bulunan bir cihazı temsil eder. */
+data class PeerInfo(
+    val id: String,
+    val name: String,
+    val address: InetAddress,
+    var lastSeen: Long
+)
 
 /**
  * Telsiz servisi.
- * - Aynı WiFi ağında UDP broadcast ile diğer cihazı otomatik bulur (keşif).
- * - Bulunan cihaza ham PCM ses paketleri gönderir / ondan gelenleri çalar.
- * - Foreground Service olduğu için uygulama kapansa/arka plana atılsa bile çalışmaya devam eder.
- * - Ekranın üstünde kayan bir "KONUŞ" butonu gösterir, böylece uygulamayı açmadan da
- *   basılı tutarak konuşabilirsin (overlay izni verilmişse).
+ * - Aynı WiFi ağındaki tüm cihazları UDP broadcast ile keşfeder (liste halinde).
+ * - Kullanıcının seçtiği cihaza ses gönderir (bas-konuş) — gönderme her zaman, uygulama
+ *   kapalı olsa bile çalışır (foreground service + kayan buton sayesinde).
+ * - Ses ALMA (dinleme) ise dışarıdan start/stopListening() ile açılıp kapatılır;
+ *   bunu MainActivity, uygulama görünür olduğunda açık, olmadığında kapalı tutacak şekilde çağırır.
  */
 class WalkieTalkieService : Service() {
 
@@ -44,6 +54,7 @@ class WalkieTalkieService : Service() {
         const val AUDIO_PORT = 8889
         const val SAMPLE_RATE = 16000
         const val CHANNEL_ID = "walkie_channel"
+        const val PEER_TIMEOUT_MS = 8000L
     }
 
     private val binder = LocalBinder()
@@ -53,39 +64,45 @@ class WalkieTalkieService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     private val myId = UUID.randomUUID().toString()
+    private var myName: String = "Cihaz"
+
     @Volatile private var running = false
     @Volatile private var transmitting = false
+    @Volatile private var listening = false
 
     private var discoverySocket: DatagramSocket? = null
     private var audioSocket: DatagramSocket? = null
-    @Volatile private var peerAddress: InetAddress? = null
-
     private var audioTrack: AudioTrack? = null
-    private var multicastLock: WifiManager.MulticastLock? = null
 
+    private val peers = ConcurrentHashMap<String, PeerInfo>()
+    @Volatile private var selectedPeerId: String? = null
+
+    private var multicastLock: WifiManager.MulticastLock? = null
     private var windowManager: WindowManager? = null
     private var floatingButton: View? = null
 
-    // Aktivite bu callback ile durum mesajlarını (bağlandı / aranıyor) alır
+    // UI callback'leri
     var onStatusChanged: ((String) -> Unit)? = null
+    var onPeersChanged: ((List<PeerInfo>) -> Unit)? = null
 
     override fun onCreate() {
         super.onCreate()
+        myName = getSharedPreferences("walkie_prefs", Context.MODE_PRIVATE)
+            .getString("device_name", null) ?: Build.MODEL ?: "Cihaz"
         running = true
         startForegroundNotification()
         acquireMulticastLock()
         startDiscoveryLoop()
-        startAudioReceiver()
+        startPeerCleanupLoop()
         showFloatingButton()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         running = false
         transmitting = false
+        listening = false
         try { discoverySocket?.close() } catch (e: Exception) {}
         try { audioSocket?.close() } catch (e: Exception) {}
         try { audioTrack?.stop() } catch (e: Exception) {}
@@ -95,26 +112,22 @@ class WalkieTalkieService : Service() {
         super.onDestroy()
     }
 
-    // ---------- Bildirim (Foreground Service için zorunlu) ----------
+    // ---------- Bildirim ----------
 
     private fun startForegroundNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "Telsiz", NotificationManager.IMPORTANCE_LOW
-            )
+            val channel = NotificationChannel(CHANNEL_ID, "Telsiz", NotificationManager.IMPORTANCE_LOW)
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
         }
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Telsiz aktif")
-            .setContentText("Aynı ağdaki cihaz aranıyor / dinleniyor...")
+            .setContentText("Adım: $myName — cihazlar aranıyor...")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .build()
         startForeground(1, notification)
     }
-
-    // ---------- WiFi broadcast paketlerini almak için gerekli kilit ----------
 
     private fun acquireMulticastLock() {
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -133,7 +146,7 @@ class WalkieTalkieService : Service() {
         return InetAddress.getByAddress(quads)
     }
 
-    // ---------- Keşif: diğer cihazı bulma ----------
+    // ---------- Keşif: ağdaki TÜM cihazları bul, listele ----------
 
     private fun startDiscoveryLoop() {
         thread {
@@ -141,32 +154,32 @@ class WalkieTalkieService : Service() {
                 discoverySocket = DatagramSocket(null).apply {
                     reuseAddress = true
                     broadcast = true
-                    bind(java.net.InetSocketAddress(DISCOVERY_PORT))
+                    bind(InetSocketAddress(DISCOVERY_PORT))
                 }
 
-                // Periyodik olarak "buradayım" yayını yap
                 thread {
                     while (running) {
                         try {
-                            val msg = "WALKIE_HELLO:$myId".toByteArray()
+                            val safeName = myName.replace(":", " ")
+                            val msg = "WALKIE_HELLO:$myId:$safeName".toByteArray()
                             val addr = getBroadcastAddress()
                             discoverySocket?.send(DatagramPacket(msg, msg.size, addr, DISCOVERY_PORT))
-                        } catch (e: Exception) { /* yok say, tekrar denenecek */ }
+                        } catch (e: Exception) { }
                         Thread.sleep(2000)
                     }
                 }
 
-                // Gelen yayınları dinle
                 val buf = ByteArray(256)
                 while (running) {
                     val packet = DatagramPacket(buf, buf.size)
                     discoverySocket?.receive(packet)
                     val text = String(packet.data, 0, packet.length)
-                    if (text.startsWith("WALKIE_HELLO:") && !text.endsWith(myId)) {
-                        if (peerAddress?.hostAddress != packet.address.hostAddress) {
-                            peerAddress = packet.address
-                            onStatusChanged?.invoke("Bağlandı: ${packet.address.hostAddress}")
-                        }
+                    val parts = text.split(":", limit = 3)
+                    if (parts.size == 3 && parts[0] == "WALKIE_HELLO" && parts[1] != myId) {
+                        val id = parts[1]
+                        val name = parts[2]
+                        peers[id] = PeerInfo(id, name, packet.address, System.currentTimeMillis())
+                        onPeersChanged?.invoke(peers.values.sortedBy { it.name })
                     }
                 }
             } catch (e: Exception) {
@@ -175,9 +188,39 @@ class WalkieTalkieService : Service() {
         }
     }
 
-    // ---------- Ses alma / çalma (her zaman açık, arka planda da) ----------
+    private fun startPeerCleanupLoop() {
+        thread {
+            while (running) {
+                Thread.sleep(3000)
+                val now = System.currentTimeMillis()
+                val before = peers.size
+                peers.entries.removeIf { now - it.value.lastSeen > PEER_TIMEOUT_MS }
+                if (peers.size != before) {
+                    onPeersChanged?.invoke(peers.values.sortedBy { it.name })
+                    if (selectedPeerId != null && !peers.containsKey(selectedPeerId)) {
+                        selectedPeerId = null
+                        onStatusChanged?.invoke("Seçili cihaz bağlantıyı kaybetti")
+                    }
+                }
+            }
+        }
+    }
 
-    private fun startAudioReceiver() {
+    fun selectPeer(id: String) {
+        selectedPeerId = id
+        val p = peers[id]
+        onStatusChanged?.invoke(if (p != null) "Seçili: ${p.name}" else "Cihaz bulunamadı")
+    }
+
+    fun getSelectedPeerId(): String? = selectedPeerId
+    fun getCurrentPeers(): List<PeerInfo> = peers.values.sortedBy { it.name }
+    fun getMyName(): String = myName
+
+    // ---------- Ses ALMA (dinleme) — sadece uygulama görünürken açık ----------
+
+    fun startListening() {
+        if (listening) return
+        listening = true
         thread {
             try {
                 audioSocket = DatagramSocket(AUDIO_PORT)
@@ -195,24 +238,39 @@ class WalkieTalkieService : Service() {
                 audioTrack?.play()
 
                 val buf = ByteArray(2048)
-                while (running) {
+                while (listening) {
                     val packet = DatagramPacket(buf, buf.size)
                     audioSocket?.receive(packet)
-                    audioTrack?.write(packet.data, 0, packet.length)
+                    // sadece seçili cihazdan gelen sesi çal
+                    val selected = selectedPeerId?.let { peers[it] }
+                    if (selected != null && packet.address.hostAddress == selected.address.hostAddress) {
+                        audioTrack?.write(packet.data, 0, packet.length)
+                    }
                 }
             } catch (e: Exception) {
-                onStatusChanged?.invoke("Ses alma hatası: ${e.message}")
+                // dinleme kapatılırken soket kapanır, hata normal, yok say
+            } finally {
+                try { audioSocket?.close() } catch (e: Exception) {}
+                try { audioTrack?.stop() } catch (e: Exception) {}
+                try { audioTrack?.release() } catch (e: Exception) {}
+                audioTrack = null
+                audioSocket = null
             }
         }
     }
 
-    // ---------- Ses gönderme (sadece PTT butonuna basılıyken) ----------
+    fun stopListening() {
+        listening = false
+        try { audioSocket?.close() } catch (e: Exception) {}
+    }
+
+    // ---------- Ses GÖNDERME (PTT) — her zaman çalışır, uygulama kapalıyken de ----------
 
     fun startTransmitting() {
         if (transmitting) return
-        val peer = peerAddress
+        val peer = selectedPeerId?.let { peers[it] }
         if (peer == null) {
-            onStatusChanged?.invoke("Henüz karşı cihaz bulunamadı, bekleniyor...")
+            onStatusChanged?.invoke("Önce bir cihaz seç")
             return
         }
         transmitting = true
@@ -236,7 +294,7 @@ class WalkieTalkieService : Service() {
                 while (transmitting) {
                     val read = recorder.read(buf, 0, buf.size)
                     if (read > 0) {
-                        sendSocket.send(DatagramPacket(buf, read, peer, AUDIO_PORT))
+                        sendSocket.send(DatagramPacket(buf, read, peer.address, AUDIO_PORT))
                     }
                 }
             } catch (e: Exception) {
@@ -253,15 +311,10 @@ class WalkieTalkieService : Service() {
         transmitting = false
     }
 
-    fun isTransmitting(): Boolean = transmitting
-    fun hasPeer(): Boolean = peerAddress != null
-
-    // ---------- Ekranın üstünde kayan PTT butonu (uygulama kapalıyken de kullanılabilir) ----------
+    // ---------- Kayan PTT butonu ----------
 
     private fun showFloatingButton() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            return // izin verilmemiş, sorun değil: uygulama içi buton yine çalışır
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) return
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
         val button = Button(this).apply {
@@ -319,9 +372,7 @@ class WalkieTalkieService : Service() {
         floatingButton = button
         try {
             windowManager?.addView(button, params)
-        } catch (e: Exception) {
-            // overlay eklenemedi (izin sorunu vb.), sessizce geç
-        }
+        } catch (e: Exception) { }
     }
 
     private fun removeFloatingButton() {
