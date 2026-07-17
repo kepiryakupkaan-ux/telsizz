@@ -11,8 +11,12 @@ import android.os.Bundle
 import android.os.IBinder
 import android.provider.Settings
 import android.view.MotionEvent
+import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
+import android.widget.ListView
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -24,6 +28,10 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var pttButton: Button
+    private lateinit var deviceListView: ListView
+
+    private var currentPeers: List<PeerInfo> = emptyList()
+    private lateinit var listAdapter: ArrayAdapter<String>
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -33,6 +41,12 @@ class MainActivity : AppCompatActivity() {
             service?.onStatusChanged = { status ->
                 runOnUiThread { statusText.text = status }
             }
+            service?.onPeersChanged = { peers ->
+                runOnUiThread { updatePeerList(peers) }
+            }
+            // Aktivite zaten görünür durumdaysa dinlemeyi hemen başlat
+            service?.startListening()
+            runOnUiThread { updatePeerList(service?.getCurrentPeers() ?: emptyList()) }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             bound = false
@@ -46,6 +60,18 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.statusText)
         pttButton = findViewById(R.id.pttButton)
+        deviceListView = findViewById(R.id.deviceListView)
+
+        listAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_single_choice, mutableListOf())
+        deviceListView.adapter = listAdapter
+        deviceListView.choiceMode = ListView.CHOICE_MODE_SINGLE
+
+        deviceListView.setOnItemClickListener { _, _, position, _ ->
+            if (position < currentPeers.size) {
+                val peer = currentPeers[position]
+                service?.selectPeer(peer.id)
+            }
+        }
 
         pttButton.setOnTouchListener { _, event ->
             when (event.action) {
@@ -63,8 +89,47 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        requestNeededPermissions()
+        ensureDeviceName {
+            requestNeededPermissions()
+        }
     }
+
+    private fun updatePeerList(peers: List<PeerInfo>) {
+        currentPeers = peers
+        listAdapter.clear()
+        listAdapter.addAll(peers.map { it.name })
+        listAdapter.notifyDataSetChanged()
+        if (peers.isEmpty()) {
+            statusText.text = "Aynı WiFi'deki cihazlar aranıyor..."
+        }
+    }
+
+    // ---------- Cihaz adı: ilk açılışta bir kere sorulur ----------
+
+    private fun ensureDeviceName(onDone: () -> Unit) {
+        val prefs = getSharedPreferences("walkie_prefs", Context.MODE_PRIVATE)
+        val existing = prefs.getString("device_name", null)
+        if (!existing.isNullOrBlank()) {
+            onDone()
+            return
+        }
+        val input = EditText(this).apply {
+            hint = "Örn: Ahmetin Telefonu"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Cihazına bir isim ver")
+            .setMessage("Bu isim, diğer cihazların listesinde görünecek.")
+            .setView(input)
+            .setCancelable(false)
+            .setPositiveButton("Kaydet") { _, _ ->
+                val name = input.text.toString().trim().ifBlank { Build.MODEL ?: "Cihaz" }
+                prefs.edit().putString("device_name", name).apply()
+                onDone()
+            }
+            .show()
+    }
+
+    // ---------- İzinler ----------
 
     private fun requestNeededPermissions() {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
@@ -78,7 +143,6 @@ class MainActivity : AppCompatActivity() {
             ActivityCompat.requestPermissions(this, missing.toTypedArray(), 100)
         }
 
-        // Kayan buton için overlay izni (isteğe bağlı ama önerilir)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
             statusText.text = "Arka planda buton için 'diğer uygulamaların üzerine çizme' iznini de aç"
             val intent = Intent(
@@ -101,12 +165,24 @@ class MainActivity : AppCompatActivity() {
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
     }
 
+    // ---------- Yaşam döngüsü: sadece uygulama görünürken dinle ----------
+
+    override fun onStart() {
+        super.onStart()
+        service?.startListening()
+    }
+
+    override fun onStop() {
+        service?.stopListening()
+        super.onStop()
+    }
+
     override fun onDestroy() {
         if (bound) {
             unbindService(connection)
             bound = false
         }
         super.onDestroy()
-        // Not: servis burada durdurulmuyor -> uygulama kapansa bile arka planda dinlemeye devam eder.
+        // Not: servis burada durdurulmuyor -> gönderme (PTT) uygulama kapansa bile çalışmaya devam eder.
     }
 }
