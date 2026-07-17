@@ -5,8 +5,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
-import android.graphics.PixelFormat
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -16,12 +14,6 @@ import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
-import android.provider.Settings
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
-import android.view.WindowManager
-import android.widget.Button
 import androidx.core.app.NotificationCompat
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -39,13 +31,22 @@ data class PeerInfo(
     var lastSeen: Long
 )
 
+private data class RequesterInfo(val address: InetAddress, var lastSeen: Long)
+
 /**
  * Telsiz servisi.
- * - Aynı WiFi ağındaki tüm cihazları UDP broadcast ile keşfeder (liste halinde).
- * - Kullanıcının seçtiği cihaza ses gönderir (bas-konuş) — gönderme her zaman, uygulama
- *   kapalı olsa bile çalışır (foreground service + kayan buton sayesinde).
- * - Ses ALMA (dinleme) ise dışarıdan start/stopListening() ile açılıp kapatılır;
- *   bunu MainActivity, uygulama görünür olduğunda açık, olmadığında kapalı tutacak şekilde çağırır.
+ *
+ * İKİ BAĞIMSIZ MEKANİZMA:
+ *
+ * 1) BAS KONUŞ (manuel, zorla gönderme): Kullanıcı butona bastığı sürece kendi sesini
+ *    seçili cihaza gönderir. Karşı taraf hiçbir şey yapmasa da, uygulaması kapalı olsa da,
+ *    kayan buton sayesinde bu her zaman kullanılabilir.
+ *
+ * 2) BAS DİNLE (uzaktan tetikleme, zorla alma): Kullanıcı butona bastığı sürece seçili
+ *    cihaza küçük bir "LISTEN_REQ" sinyali gönderir. Bu sinyali alan cihaz, kendi
+ *    kullanıcısı hiçbir şey yapmasa bile (uygulaması kapalı/arka planda olsa bile)
+ *    otomatik olarak mikrofonunu açıp isteği yapan cihaza ses akıtmaya başlar.
+ *    Buton bırakılınca sinyal kesilir, birkaç saniye içinde karşı taraf da durur.
  */
 class WalkieTalkieService : Service() {
 
@@ -55,6 +56,8 @@ class WalkieTalkieService : Service() {
         const val SAMPLE_RATE = 16000
         const val CHANNEL_ID = "walkie_channel"
         const val PEER_TIMEOUT_MS = 8000L
+        const val LISTEN_REQ_INTERVAL_MS = 500L
+        const val LISTEN_REQ_EXPIRE_MS = 1500L
     }
 
     private val binder = LocalBinder()
@@ -67,21 +70,31 @@ class WalkieTalkieService : Service() {
     private var myName: String = "Cihaz"
 
     @Volatile private var running = false
-    @Volatile private var transmitting = false
-    @Volatile private var listening = false
 
-    private var discoverySocket: DatagramSocket? = null
+    // --- BAS KONUŞ (manuel gönderme) durumu ---
+    @Volatile private var manualTransmitting = false
+    private var manualSendThread: Thread? = null
+
+    // --- BAS DİNLE (uzaktan istek gönderme) durumu ---
+    @Volatile private var requestingListenFrom = false
+    private var listenRequestThread: Thread? = null
+
+    // --- Karşıdan bize gelen "beni dinlet" istekleri (bizim mikrofonumuzu isteyenler) ---
+    private val remoteListenRequesters = ConcurrentHashMap<String, RequesterInfo>()
+    @Volatile private var remoteBroadcasting = false
+    private var remoteBroadcastThread: Thread? = null
+
+    // --- Ses alma (kendi hoparlörümüzden çalma) ---
+    @Volatile private var listening = false
     private var audioSocket: DatagramSocket? = null
     private var audioTrack: AudioTrack? = null
 
+    private var discoverySocket: DatagramSocket? = null
     private val peers = ConcurrentHashMap<String, PeerInfo>()
     @Volatile private var selectedPeerId: String? = null
 
     private var multicastLock: WifiManager.MulticastLock? = null
-    private var windowManager: WindowManager? = null
-    private var floatingButton: View? = null
 
-    // UI callback'leri
     var onStatusChanged: ((String) -> Unit)? = null
     var onPeersChanged: ((List<PeerInfo>) -> Unit)? = null
 
@@ -94,21 +107,22 @@ class WalkieTalkieService : Service() {
         acquireMulticastLock()
         startDiscoveryLoop()
         startPeerCleanupLoop()
-        showFloatingButton()
+        startRemoteRequesterCleanupLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         running = false
-        transmitting = false
+        manualTransmitting = false
+        requestingListenFrom = false
+        remoteBroadcasting = false
         listening = false
         try { discoverySocket?.close() } catch (e: Exception) {}
         try { audioSocket?.close() } catch (e: Exception) {}
         try { audioTrack?.stop() } catch (e: Exception) {}
         try { audioTrack?.release() } catch (e: Exception) {}
         try { multicastLock?.release() } catch (e: Exception) {}
-        removeFloatingButton()
         super.onDestroy()
     }
 
@@ -146,7 +160,7 @@ class WalkieTalkieService : Service() {
         return InetAddress.getByAddress(quads)
     }
 
-    // ---------- Keşif: ağdaki TÜM cihazları bul, listele ----------
+    // ---------- Keşif + kontrol mesajları (aynı soket üzerinden) ----------
 
     private fun startDiscoveryLoop() {
         thread {
@@ -157,6 +171,7 @@ class WalkieTalkieService : Service() {
                     bind(InetSocketAddress(DISCOVERY_PORT))
                 }
 
+                // Periyodik "buradayım" yayını
                 thread {
                     while (running) {
                         try {
@@ -175,11 +190,18 @@ class WalkieTalkieService : Service() {
                     discoverySocket?.receive(packet)
                     val text = String(packet.data, 0, packet.length)
                     val parts = text.split(":", limit = 3)
-                    if (parts.size == 3 && parts[0] == "WALKIE_HELLO" && parts[1] != myId) {
-                        val id = parts[1]
-                        val name = parts[2]
-                        peers[id] = PeerInfo(id, name, packet.address, System.currentTimeMillis())
-                        onPeersChanged?.invoke(peers.values.sortedBy { it.name })
+
+                    when {
+                        parts.size == 3 && parts[0] == "WALKIE_HELLO" && parts[1] != myId -> {
+                            val id = parts[1]; val name = parts[2]
+                            peers[id] = PeerInfo(id, name, packet.address, System.currentTimeMillis())
+                            onPeersChanged?.invoke(peers.values.sortedBy { it.name })
+                        }
+                        parts.size >= 2 && parts[0] == "LISTEN_REQ" && parts[1] != myId -> {
+                            val requesterId = parts[1]
+                            remoteListenRequesters[requesterId] = RequesterInfo(packet.address, System.currentTimeMillis())
+                            ensureRemoteBroadcastRunning()
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -206,6 +228,20 @@ class WalkieTalkieService : Service() {
         }
     }
 
+    /** Bizden ses isteyip de artık istek göndermeyi bırakanları listeden temizler (zaman aşımı). */
+    private fun startRemoteRequesterCleanupLoop() {
+        thread {
+            while (running) {
+                Thread.sleep(400)
+                val now = System.currentTimeMillis()
+                remoteListenRequesters.entries.removeIf { now - it.value.lastSeen > LISTEN_REQ_EXPIRE_MS }
+                if (remoteListenRequesters.isEmpty()) {
+                    remoteBroadcasting = false
+                }
+            }
+        }
+    }
+
     fun selectPeer(id: String) {
         selectedPeerId = id
         val p = peers[id]
@@ -216,9 +252,55 @@ class WalkieTalkieService : Service() {
     fun getCurrentPeers(): List<PeerInfo> = peers.values.sortedBy { it.name }
     fun getMyName(): String = myName
 
-    // ---------- Ses ALMA (dinleme) — sadece uygulama görünürken açık ----------
+    // ==================== BAS KONUŞ: manuel, zorla gönderme ====================
 
-    fun startListening() {
+    fun startTransmitting() {
+        if (manualTransmitting) return
+        val peer = selectedPeerId?.let { peers[it] }
+        if (peer == null) {
+            onStatusChanged?.invoke("Önce bir cihaz seç")
+            return
+        }
+        manualTransmitting = true
+        manualSendThread = thread {
+            sendMicTo(peer.address) { manualTransmitting }
+        }
+    }
+
+    fun stopTransmitting() {
+        manualTransmitting = false
+    }
+
+    // ==================== BAS DİNLE: uzaktan istek gönder + gelen sesi çal ====================
+
+    /** Kullanıcı BAS DİNLE'ye bastığında çağrılır. */
+    fun startRequestingAudio() {
+        val peer = selectedPeerId?.let { peers[it] }
+        if (peer == null) {
+            onStatusChanged?.invoke("Önce bir cihaz seç")
+            return
+        }
+        if (requestingListenFrom) return
+        requestingListenFrom = true
+        listenRequestThread = thread {
+            while (requestingListenFrom) {
+                try {
+                    val msg = "LISTEN_REQ:$myId".toByteArray()
+                    discoverySocket?.send(DatagramPacket(msg, msg.size, peer.address, DISCOVERY_PORT))
+                } catch (e: Exception) { }
+                Thread.sleep(LISTEN_REQ_INTERVAL_MS)
+            }
+        }
+        startListening()
+    }
+
+    /** Kullanıcı BAS DİNLE'yi bıraktığında çağrılır. */
+    fun stopRequestingAudio() {
+        requestingListenFrom = false
+        stopListening()
+    }
+
+    private fun startListening() {
         if (listening) return
         listening = true
         thread {
@@ -241,14 +323,10 @@ class WalkieTalkieService : Service() {
                 while (listening) {
                     val packet = DatagramPacket(buf, buf.size)
                     audioSocket?.receive(packet)
-                    // sadece seçili cihazdan gelen sesi çal
-                    val selected = selectedPeerId?.let { peers[it] }
-                    if (selected != null && packet.address.hostAddress == selected.address.hostAddress) {
-                        audioTrack?.write(packet.data, 0, packet.length)
-                    }
+                    audioTrack?.write(packet.data, 0, packet.length)
                 }
             } catch (e: Exception) {
-                // dinleme kapatılırken soket kapanır, hata normal, yok say
+                // soket kapanırken oluşan hata normal, yok say
             } finally {
                 try { audioSocket?.close() } catch (e: Exception) {}
                 try { audioTrack?.stop() } catch (e: Exception) {}
@@ -259,22 +337,17 @@ class WalkieTalkieService : Service() {
         }
     }
 
-    fun stopListening() {
+    private fun stopListening() {
         listening = false
         try { audioSocket?.close() } catch (e: Exception) {}
     }
 
-    // ---------- Ses GÖNDERME (PTT) — her zaman çalışır, uygulama kapalıyken de ----------
+    // ==================== Karşıdan "LISTEN_REQ" gelince: mikrofonu otomatik aç ====================
 
-    fun startTransmitting() {
-        if (transmitting) return
-        val peer = selectedPeerId?.let { peers[it] }
-        if (peer == null) {
-            onStatusChanged?.invoke("Önce bir cihaz seç")
-            return
-        }
-        transmitting = true
-        thread {
+    private fun ensureRemoteBroadcastRunning() {
+        if (remoteBroadcasting) return
+        remoteBroadcasting = true
+        remoteBroadcastThread = thread {
             var recorder: AudioRecord? = null
             var sendSocket: DatagramSocket? = null
             try {
@@ -291,93 +364,60 @@ class WalkieTalkieService : Service() {
                 sendSocket = DatagramSocket()
                 val buf = ByteArray(2048)
                 recorder.startRecording()
-                while (transmitting) {
+                while (remoteBroadcasting && remoteListenRequesters.isNotEmpty()) {
                     val read = recorder.read(buf, 0, buf.size)
                     if (read > 0) {
-                        sendSocket.send(DatagramPacket(buf, read, peer.address, AUDIO_PORT))
+                        // o an bizi isteyen herkese gönder
+                        for (requester in remoteListenRequesters.values) {
+                            try {
+                                sendSocket.send(DatagramPacket(buf, read, requester.address, AUDIO_PORT))
+                            } catch (e: Exception) { }
+                        }
                     }
                 }
             } catch (e: Exception) {
-                onStatusChanged?.invoke("Gönderim hatası: ${e.message}")
+                onStatusChanged?.invoke("Uzaktan yayın hatası: ${e.message}")
             } finally {
                 try { recorder?.stop() } catch (e: Exception) {}
                 try { recorder?.release() } catch (e: Exception) {}
                 try { sendSocket?.close() } catch (e: Exception) {}
+                remoteBroadcasting = false
             }
         }
     }
 
-    fun stopTransmitting() {
-        transmitting = false
-    }
+    // ==================== Ortak: mikrofonu belirli bir adrese sürekli gönder ====================
 
-    // ---------- Kayan PTT butonu ----------
-
-    private fun showFloatingButton() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) return
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-        val button = Button(this).apply {
-            text = "KONUŞ"
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#2E7D32"))
-            alpha = 0.9f
-        }
-
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.TOP or Gravity.START
-        params.x = 0
-        params.y = 300
-
-        var lastTouchX = 0f
-        var lastTouchY = 0f
-        var initialX = 0
-        var initialY = 0
-
-        button.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initialX = params.x
-                    initialY = params.y
-                    lastTouchX = event.rawX
-                    lastTouchY = event.rawY
-                    startTransmitting()
-                    true
+    private fun sendMicTo(target: InetAddress, keepRunning: () -> Boolean) {
+        var recorder: AudioRecord? = null
+        var sendSocket: DatagramSocket? = null
+        try {
+            val minBuf = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            recorder = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBuf
+            )
+            sendSocket = DatagramSocket()
+            val buf = ByteArray(2048)
+            recorder.startRecording()
+            while (keepRunning()) {
+                val read = recorder.read(buf, 0, buf.size)
+                if (read > 0) {
+                    sendSocket.send(DatagramPacket(buf, read, target, AUDIO_PORT))
                 }
-                MotionEvent.ACTION_MOVE -> {
-                    params.x = initialX + (event.rawX - lastTouchX).toInt()
-                    params.y = initialY + (event.rawY - lastTouchY).toInt()
-                    windowManager?.updateViewLayout(button, params)
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    stopTransmitting()
-                    true
-                }
-                else -> false
             }
+        } catch (e: Exception) {
+            onStatusChanged?.invoke("Gönderim hatası: ${e.message}")
+        } finally {
+            try { recorder?.stop() } catch (e: Exception) {}
+            try { recorder?.release() } catch (e: Exception) {}
+            try { sendSocket?.close() } catch (e: Exception) {}
         }
-
-        floatingButton = button
-        try {
-            windowManager?.addView(button, params)
-        } catch (e: Exception) { }
     }
 
-    private fun removeFloatingButton() {
-        try {
-            floatingButton?.let { windowManager?.removeView(it) }
-        } catch (e: Exception) {}
-    }
 }
