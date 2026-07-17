@@ -3,33 +3,40 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:gravity="center"
-    android:padding="24dp">
+    android:padding="16dp">
 
     <TextView
         android:id="@+id/statusText"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Aynı WiFi'deki cihaz aranıyor..."
+        android:text="Aynı WiFi'deki cihazlar aranıyor..."
         android:textSize="16sp"
         android:gravity="center"
-        android:layout_marginBottom="32dp" />
-
-    <Button
-        android:id="@+id/pttButton"
-        android:layout_width="200dp"
-        android:layout_height="200dp"
-        android:text="BASILI TUT VE KONUŞ"
-        android:textSize="14sp"
-        android:backgroundTint="#2E7D32"
-        android:textColor="#FFFFFF" />
+        android:padding="8dp" />
 
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="24dp"
-        android:text="Uygulamayı kapatsan bile ekranda yeşil bir 'KONUŞ' butonu belirir, arka planda dinlemeye devam eder."
-        android:textSize="12sp"
-        android:gravity="center" />
+        android:text="Konuşmak istediğin cihazı seç:"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:layout_marginTop="8dp" />
+
+    <ListView
+        android:id="@+id/deviceListView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="16dp" />
+
+    <Button
+        android:id="@+id/pttButton"
+        android:layout_width="match_parent"
+        android:layout_height="140dp"
+        android:text="BASILI TUT VE KONUŞ"
+        android:textSize="16sp"
+        android:backgroundTint="#2E7D32"
+        android:textColor="#FFFFFF" />
 
 </LinearLayout>
