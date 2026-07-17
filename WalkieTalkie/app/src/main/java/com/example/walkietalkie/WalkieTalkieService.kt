@@ -273,7 +273,7 @@ class WalkieTalkieService : Service() {
 
     // ==================== BAS DİNLE: uzaktan istek gönder + gelen sesi çal ====================
 
-    /** Kullanıcı BAS DİNLE'ye bastığında çağrılır. */
+    /** Kullanıcı BAS DİNLE'ye bastığında çağrılır — SADECE sinyal gönderir, çalma işini etkilemez. */
     fun startRequestingAudio() {
         val peer = selectedPeerId?.let { peers[it] }
         if (peer == null) {
@@ -291,16 +291,15 @@ class WalkieTalkieService : Service() {
                 Thread.sleep(LISTEN_REQ_INTERVAL_MS)
             }
         }
-        startListening()
     }
 
     /** Kullanıcı BAS DİNLE'yi bıraktığında çağrılır. */
     fun stopRequestingAudio() {
         requestingListenFrom = false
-        stopListening()
     }
 
-    private fun startListening() {
+    /** Uygulama görünür olduğunda çağrılır (MainActivity onStart/bağlanınca) — gelen sesi HER ZAMAN çalar. */
+    fun startListening() {
         if (listening) return
         listening = true
         thread {
@@ -337,7 +336,8 @@ class WalkieTalkieService : Service() {
         }
     }
 
-    private fun stopListening() {
+    /** Uygulama arka plana atıldığında çağrılır (MainActivity onStop). */
+    fun stopListening() {
         listening = false
         try { audioSocket?.close() } catch (e: Exception) {}
     }
